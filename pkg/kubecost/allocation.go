@@ -8,6 +8,7 @@ import (
 
 	"github.com/opencost/opencost/pkg/log"
 	"github.com/opencost/opencost/pkg/util"
+	"github.com/opencost/opencost/pkg/util/timeutil"
 )
 
 // TODO Clean-up use of IsEmpty; nil checks should be separated for safety.
@@ -81,6 +82,11 @@ type Allocation struct {
 	// RawAllocationOnly is a pointer so if it is not present it will be
 	// marshalled as null rather than as an object with Go default values.
 	RawAllocationOnly *RawAllocationOnlyData `json:"rawAllocationOnly"`
+	// ProportionalAssetResourceCost represents the per-resource costs of the
+	// allocation as a percentage of the per-resource total cost of the
+	// asset on which the allocation was run. It is optionally computed
+	// and appended to an Allocation, and so by default is is nil.
+	ProportionalAssetResourceCosts ProportionalAssetResourceCosts `json:"proportionalAssetResourceCosts"`
 }
 
 // RawAllocationOnlyData is information that only belong in "raw" Allocations,
@@ -238,6 +244,57 @@ func (pva *PVAllocation) Equal(that *PVAllocation) bool {
 	}
 	return util.IsApproximately(pva.ByteHours, that.ByteHours) &&
 		util.IsApproximately(pva.Cost, that.Cost)
+}
+
+type ProportionalAssetResourceCost struct {
+	Cluster       string  `json:"cluster"`
+	Node          string  `json:"node,omitempty"`
+	ProviderID    string  `json:"providerID,omitempty"`
+	CPUPercentage float64 `json:"cpuPercentage"`
+	GPUPercentage float64 `json:"gpuPercentage"`
+	RAMPercentage float64 `json:"ramPercentage"`
+}
+
+func (parc ProportionalAssetResourceCost) Key(insertByNode bool) string {
+	if insertByNode {
+		return parc.Cluster + "," + parc.Node
+	} else {
+		return parc.Cluster
+	}
+
+}
+
+type ProportionalAssetResourceCosts map[string]ProportionalAssetResourceCost
+
+func (parcs ProportionalAssetResourceCosts) Insert(parc ProportionalAssetResourceCost, insertByNode bool) {
+	if !insertByNode {
+		parc.Node = ""
+		parc.ProviderID = ""
+	}
+	if curr, ok := parcs[parc.Key(insertByNode)]; ok {
+		parcs[parc.Key(insertByNode)] = ProportionalAssetResourceCost{
+			Node:          curr.Node,
+			Cluster:       curr.Cluster,
+			ProviderID:    curr.ProviderID,
+			CPUPercentage: curr.CPUPercentage + parc.CPUPercentage,
+			GPUPercentage: curr.GPUPercentage + parc.GPUPercentage,
+			RAMPercentage: curr.RAMPercentage + parc.RAMPercentage,
+		}
+	} else {
+		parcs[parc.Key(insertByNode)] = parc
+	}
+}
+
+func (parcs ProportionalAssetResourceCosts) Add(that ProportionalAssetResourceCosts) {
+
+	for _, parc := range that {
+		// if node field is empty, we know this is a cluster level PARC aggregation
+		insertByNode := true
+		if parc.Node == "" {
+			insertByNode = false
+		}
+		parcs.Insert(parc, insertByNode)
+	}
 }
 
 // GetWindow returns the window of the struct
@@ -714,6 +771,12 @@ func (a *Allocation) add(that *Allocation) {
 	// Preserve string properties that are matching between the two allocations
 	a.Properties = a.Properties.Intersection(that.Properties)
 
+	// If both Allocations have ProportionalAssetResourceCosts, then
+	// add those from the given Allocation into the receiver.
+	if a.ProportionalAssetResourceCosts != nil && that.ProportionalAssetResourceCosts != nil {
+		a.ProportionalAssetResourceCosts.Add(that.ProportionalAssetResourceCosts)
+	}
+
 	// Overwrite regular intersection logic for the controller name property in the
 	// case that the Allocation keys are the same but the controllers are not.
 	if leftKey == rightKey &&
@@ -845,18 +908,20 @@ func NewAllocationSet(start, end time.Time, allocs ...*Allocation) *AllocationSe
 // succeeds, the allocation is marked as a shared resource. ShareIdle is a
 // simple flag for sharing idle resources.
 type AllocationAggregationOptions struct {
-	AllocationTotalsStore AllocationTotalsStore
-	Filter                AllocationFilter
-	IdleByNode            bool
-	LabelConfig           *LabelConfig
-	MergeUnallocated      bool
-	Reconcile             bool
-	ReconcileNetwork      bool
-	ShareFuncs            []AllocationMatchFunc
-	ShareIdle             string
-	ShareSplit            string
-	SharedHourlyCosts     map[string]float64
-	SplitIdle             bool
+	AllocationTotalsStore                 AllocationTotalsStore
+	Filter                                AllocationFilter
+	IdleByNode                            bool
+	IncludeProportionalAssetResourceCosts bool
+	LabelConfig                           *LabelConfig
+	MergeUnallocated                      bool
+	Reconcile                             bool
+	ReconcileNetwork                      bool
+	ShareFuncs                            []AllocationMatchFunc
+	ShareIdle                             string
+	ShareSplit                            string
+	SharedHourlyCosts                     map[string]float64
+	SplitIdle                             bool
+	IncludeAggregatedMetadata             bool
 }
 
 // AggregateBy aggregates the Allocations in the given AllocationSet by the given
@@ -869,14 +934,18 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 	//     Also, create the aggSet into which the results will be aggregated.
 	//
 	//  2. Compute sharing coefficients for idle and shared resources
-	//     a) if idle allocation is to be shared, compute idle coefficients
-	//     b) if idle allocation is NOT shared, but filters are present, compute
+	//     a) if idle allocation is to be shared, or if proportional asset
+	//        resource costs are to be included, then compute idle coefficients
+	//        (proportional asset resource costs are derived from idle coefficients)
+	//     b) if proportional asset costs are to be included, derive them from
+	//        idle coefficients and add them to the allocations.
+	//     c) if idle allocation is NOT shared, but filters are present, compute
 	//        idle filtration coefficients for the purpose of only returning the
 	//        portion of idle allocation that would have been shared with the
 	//        unfiltered results. (See unit tests 5.a,b,c)
-	//     c) generate shared allocation for them given shared overhead, which
+	//     d) generate shared allocation for them given shared overhead, which
 	//        must happen after (2a) and (2b)
-	//     d) if there are shared resources, compute share coefficients
+	//     e) if there are shared resources, compute share coefficients
 	//
 	//  3. Drop any allocation that fails any of the filters
 	//
@@ -936,7 +1005,7 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 	shouldAggregate := aggregateBy != nil
 	shouldFilter := options.Filter != nil
 	shouldShare := len(options.SharedHourlyCosts) > 0 || len(options.ShareFuncs) > 0
-	if !shouldAggregate && !shouldFilter && !shouldShare && options.ShareIdle == ShareNone {
+	if !shouldAggregate && !shouldFilter && !shouldShare && options.ShareIdle == ShareNone && !options.IncludeProportionalAssetResourceCosts {
 		// There is nothing for AggregateBy to do, so simply return nil
 		return nil
 	}
@@ -957,6 +1026,12 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 		Window: as.Window.Clone(),
 	}
 
+	// parcSet is used to compute proportionalAssetResourceCosts
+	// for surfacing in the API
+	parcSet := &AllocationSet{
+		Window: as.Window.Clone(),
+	}
+
 	// shareSet will be shared among aggSet after initial aggregation
 	// is complete
 	shareSet := &AllocationSet{
@@ -967,6 +1042,10 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 	// them to their respective sets, removing them from the set of allocations
 	// to aggregate.
 	for _, alloc := range as.Allocations {
+		// if the user does not want any aggregated labels/annotations returned
+		// set the properties accordingly
+		alloc.Properties.AggregatedMetadata = options.IncludeAggregatedMetadata
+
 		// External allocations get aggregated post-hoc (see step 6) and do
 		// not necessarily contain complete sets of properties, so they are
 		// moved to a separate AllocationSet.
@@ -988,6 +1067,12 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 				idleSet.Insert(alloc)
 			} else {
 				aggSet.Insert(alloc)
+			}
+
+			// build a parallel set of allocations to only be used
+			// for computing PARCs
+			if options.IncludeProportionalAssetResourceCosts {
+				parcSet.Insert(alloc.Clone())
 			}
 
 			continue
@@ -1057,7 +1142,38 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 		}
 	}
 
-	// (2b) If idle costs are not to be shared, but there are filters, then we
+	// (2b) If proportional asset resource costs are to be included, derive them
+	// from idle coefficients and add them to the allocations.
+	if options.IncludeProportionalAssetResourceCosts {
+		var parcCoefficients map[string]map[string]map[string]float64
+		if parcSet.Length() > 0 {
+			parcCoefficients, allocatedTotalsMap, err = computeIdleCoeffs(options, as, shareSet)
+			if err != nil {
+				log.Warnf("AllocationSet.AggregateBy: compute parc idle coeff: %s", err)
+				return fmt.Errorf("error computing parc coefficients: %s", err)
+			}
+		}
+		if parcCoefficients == nil {
+			return fmt.Errorf("cannot include proportional resource costs because parc coefficients are nil")
+		}
+
+		for _, alloc := range as.Allocations {
+			// Create an empty set of proportional asset resource costs,
+			// regardless of whether or not we're successful in deriving them.
+			alloc.ProportionalAssetResourceCosts = ProportionalAssetResourceCosts{}
+
+			// Attempt to derive proportional asset resource costs from idle
+			// coefficients, and insert them into the set if successful.
+			parc, err := deriveProportionalAssetResourceCostsFromIdleCoefficients(parcCoefficients, alloc, options)
+			if err != nil {
+				log.Debugf("AggregateBy: failed to derive proportional asset resource costs from idle coefficients for %s: %s", alloc.Name, err)
+				continue
+			}
+			alloc.ProportionalAssetResourceCosts.Insert(parc, options.IdleByNode)
+		}
+	}
+
+	// (2c) If idle costs are not to be shared, but there are filters, then we
 	// need to track the amount of each idle allocation to "filter" in order to
 	// maintain parity with the results when idle is shared. That is, we want
 	// to return only the idle costs that would have been shared with the given
@@ -1089,7 +1205,7 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 		}
 	}
 
-	// (2c) Convert SharedHourlyCosts to Allocations in the shareSet. This must
+	// (2d) Convert SharedHourlyCosts to Allocations in the shareSet. This must
 	// come after idle coefficients are computed so that allocations generated
 	// by shared overhead do not skew the idle coefficient computation.
 	for name, cost := range options.SharedHourlyCosts {
@@ -1114,7 +1230,7 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 		}
 	}
 
-	// (2d) Compute share coefficients for shared resources. These are computed
+	// (2e) Compute share coefficients for shared resources. These are computed
 	// after idle coefficients, and are computed for the aggregated allocations
 	// of the main allocation set. See above for details and an example.
 	var shareCoefficients map[string]float64
@@ -1623,6 +1739,34 @@ func computeIdleCoeffs(options *AllocationAggregationOptions, as *AllocationSet,
 	return coeffs, totals, nil
 }
 
+func deriveProportionalAssetResourceCostsFromIdleCoefficients(idleCoeffs map[string]map[string]map[string]float64, allocation *Allocation, options *AllocationAggregationOptions) (ProportionalAssetResourceCost, error) {
+	idleId, err := allocation.getIdleId(options)
+	if err != nil {
+		return ProportionalAssetResourceCost{}, fmt.Errorf("failed to get idle ID for allocation %s", allocation.Name)
+	}
+
+	if _, ok := idleCoeffs[idleId]; !ok {
+		return ProportionalAssetResourceCost{}, fmt.Errorf("failed to find idle coeffs for idle ID %s", idleId)
+	}
+
+	if _, ok := idleCoeffs[idleId][allocation.Name]; !ok {
+		return ProportionalAssetResourceCost{}, fmt.Errorf("failed to find idle coeffs for allocation %s", allocation.Name)
+	}
+
+	cpuPct := idleCoeffs[idleId][allocation.Name]["cpu"]
+	gpuPct := idleCoeffs[idleId][allocation.Name]["gpu"]
+	ramPct := idleCoeffs[idleId][allocation.Name]["ram"]
+
+	return ProportionalAssetResourceCost{
+		Cluster:       allocation.Properties.Cluster,
+		Node:          allocation.Properties.Node,
+		ProviderID:    allocation.Properties.ProviderID,
+		CPUPercentage: cpuPct,
+		GPUPercentage: gpuPct,
+		RAMPercentage: ramPct,
+	}, nil
+}
+
 // getIdleId returns the providerId or cluster of an Allocation depending on the IdleByNode
 // option in the AllocationAggregationOptions and an error if the respective field is missing
 func (a *Allocation) getIdleId(options *AllocationAggregationOptions) (string, error) {
@@ -2079,7 +2223,7 @@ func (asr *AllocationSetRange) Get(i int) (*AllocationSet, error) {
 
 // Accumulate sums each AllocationSet in the given range, returning a single cumulative
 // AllocationSet for the entire range.
-func (asr *AllocationSetRange) Accumulate() (*AllocationSet, error) {
+func (asr *AllocationSetRange) accumulate() (*AllocationSet, error) {
 	var allocSet *AllocationSet
 	var err error
 
@@ -2093,12 +2237,12 @@ func (asr *AllocationSetRange) Accumulate() (*AllocationSet, error) {
 	return allocSet, nil
 }
 
-// NewAccumulation clones the first available AllocationSet to use as the data structure to
+// newAccumulation clones the first available AllocationSet to use as the data structure to
 // Accumulate the remaining data. This leaves the original AllocationSetRange intact.
-func (asr *AllocationSetRange) NewAccumulation() (*AllocationSet, error) {
+func (asr *AllocationSetRange) newAccumulation() (*AllocationSet, error) {
 	// NOTE: Adding this API for consistency across SummaryAllocation and Assets, but this
 	// NOTE: implementation is almost identical to regular Accumulate(). The Accumulate() method
-	// NOTE: for Allocation returns Clone() of the input, which is required for AccumulateBy
+	// NOTE: for Allocation returns Clone() of the input, which is required for Accumulate
 	// NOTE: support (unit tests are great for verifying this information).
 	var allocSet *AllocationSet
 	var err error
@@ -2131,34 +2275,163 @@ func (asr *AllocationSetRange) NewAccumulation() (*AllocationSet, error) {
 	return allocSet, nil
 }
 
-// AccumulateBy sums AllocationSets based on the resolution given. The resolution given is subject to the scale used for the AllocationSets.
-// Resolutions not evenly divisible by the AllocationSetRange window durations Accumulate sets until a sum greater than or equal to the resolution is met,
-// at which point AccumulateBy will start summing from 0 until the requested resolution is met again.
-// If the requested resolution is smaller than the window of an AllocationSet then the resolution will default to the duration of a set.
-// Resolutions larger than the duration of the entire AllocationSetRange will default to the duration of the range.
-func (asr *AllocationSetRange) AccumulateBy(resolution time.Duration) (*AllocationSetRange, error) {
-	allocSetRange := NewAllocationSetRange()
-	var allocSet *AllocationSet
-	var err error
-
-	for i, as := range asr.Allocations {
-		allocSet, err = allocSet.Accumulate(as)
-		if err != nil {
-			return nil, err
-		}
-
-		if allocSet != nil {
-
-			// check if end of asr to sum the final set
-			// If total asr accumulated sum <= resolution return 1 accumulated set
-			if allocSet.Window.Duration() >= resolution || i == len(asr.Allocations)-1 {
-				allocSetRange.Allocations = append(allocSetRange.Allocations, allocSet)
-				allocSet = NewAllocationSet(time.Time{}, time.Time{})
-			}
-		}
+// Accumulate sums AllocationSets based on the AccumulateOption (calendar week or calendar month).
+// The accumulated set is determined by the start of the window of the allocation set.
+func (asr *AllocationSetRange) Accumulate(accumulateBy AccumulateOption) (*AllocationSetRange, error) {
+	switch accumulateBy {
+	case AccumulateOptionNone:
+		return asr.accumulateByNone()
+	case AccumulateOptionAll:
+		return asr.accumulateByAll()
+	case AccumulateOptionHour:
+		return asr.accumulateByHour()
+	case AccumulateOptionDay:
+		return asr.accumulateByDay()
+	case AccumulateOptionWeek:
+		return asr.accumulateByWeek()
+	case AccumulateOptionMonth:
+		return asr.accumulateByMonth()
+	default:
+		// ideally, this should never happen
+		return nil, fmt.Errorf("unexpected error, invalid accumulateByType: %s", accumulateBy)
 	}
 
-	return allocSetRange, nil
+}
+
+func (asr *AllocationSetRange) accumulateByAll() (*AllocationSetRange, error) {
+	var err error
+	var as *AllocationSet
+	as, err = asr.newAccumulation()
+	if err != nil {
+		return nil, fmt.Errorf("error accumulating all:%s", err)
+	}
+
+	accumulated := NewAllocationSetRange(as)
+	return accumulated, nil
+}
+
+func (asr *AllocationSetRange) accumulateByNone() (*AllocationSetRange, error) {
+	return asr.Clone(), nil
+}
+func (asr *AllocationSetRange) accumulateByHour() (*AllocationSetRange, error) {
+	// ensure that the summary allocation sets have a 1-hour window, if a set exists
+	if len(asr.Allocations) > 0 && asr.Allocations[0].Window.Duration() != time.Hour {
+		return nil, fmt.Errorf("window duration must equal 1 hour; got:%s", asr.Allocations[0].Window.Duration())
+	}
+
+	return asr.Clone(), nil
+}
+
+func (asr *AllocationSetRange) accumulateByDay() (*AllocationSetRange, error) {
+	// if the allocation set window is 1-day, just return the existing allocation set range
+	if len(asr.Allocations) > 0 && asr.Allocations[0].Window.Duration() == time.Hour*24 {
+		return asr, nil
+	}
+
+	var toAccumulate *AllocationSetRange
+	result := NewAllocationSetRange()
+	for i, as := range asr.Allocations {
+
+		if as.Window.Duration() != time.Hour {
+			return nil, fmt.Errorf("window duration must equal 1 hour; got:%s", as.Window.Duration())
+		}
+
+		hour := as.Window.Start().Hour()
+
+		if toAccumulate == nil {
+			toAccumulate = NewAllocationSetRange()
+			as = as.Clone()
+		}
+
+		toAccumulate.Append(as)
+		asAccumulated, err := toAccumulate.accumulate()
+		if err != nil {
+			return nil, fmt.Errorf("error accumulating result: %s", err)
+		}
+		toAccumulate = NewAllocationSetRange(asAccumulated)
+
+		if hour == 23 || i == len(asr.Allocations)-1 {
+			if length := len(toAccumulate.Allocations); length != 1 {
+				return nil, fmt.Errorf("failed accumulation, detected %d sets instead of 1", length)
+			}
+			result.Append(toAccumulate.Allocations[0])
+			toAccumulate = nil
+		}
+	}
+	return result, nil
+}
+
+func (asr *AllocationSetRange) accumulateByMonth() (*AllocationSetRange, error) {
+	var toAccumulate *AllocationSetRange
+	result := NewAllocationSetRange()
+	for i, as := range asr.Allocations {
+		if as.Window.Duration() != time.Hour*24 {
+			return nil, fmt.Errorf("window duration must equal 24 hours; got:%s", as.Window.Duration())
+		}
+
+		_, month, _ := as.Window.Start().Date()
+		_, nextDayMonth, _ := as.Window.Start().Add(time.Hour * 24).Date()
+
+		if toAccumulate == nil {
+			toAccumulate = NewAllocationSetRange()
+			as = as.Clone()
+		}
+
+		toAccumulate.Append(as)
+		asAccumulated, err := toAccumulate.accumulate()
+		if err != nil {
+			return nil, fmt.Errorf("error accumulating result: %s", err)
+		}
+		toAccumulate = NewAllocationSetRange(asAccumulated)
+
+		// either the month has ended, or there are no more allocation sets
+		if month != nextDayMonth || i == len(asr.Allocations)-1 {
+			if length := len(toAccumulate.Allocations); length != 1 {
+				return nil, fmt.Errorf("failed accumulation, detected %d sets instead of 1", length)
+			}
+			result.Append(toAccumulate.Allocations[0])
+			toAccumulate = nil
+		}
+	}
+	return result, nil
+}
+
+func (asr *AllocationSetRange) accumulateByWeek() (*AllocationSetRange, error) {
+	if len(asr.Allocations) > 0 && asr.Allocations[0].Window.Duration() == timeutil.Week {
+		return asr, nil
+	}
+
+	var toAccumulate *AllocationSetRange
+	result := NewAllocationSetRange()
+	for i, as := range asr.Allocations {
+		if as.Window.Duration() != time.Hour*24 {
+			return nil, fmt.Errorf("window duration must equal 24 hours; got:%s", as.Window.Duration())
+		}
+
+		dayOfWeek := as.Window.Start().Weekday()
+
+		if toAccumulate == nil {
+			toAccumulate = NewAllocationSetRange()
+			as = as.Clone()
+		}
+
+		toAccumulate.Append(as)
+		asAccumulated, err := toAccumulate.accumulate()
+		if err != nil {
+			return nil, fmt.Errorf("error accumulating result: %s", err)
+		}
+		toAccumulate = NewAllocationSetRange(asAccumulated)
+
+		// current assumption is the week always ends on Saturday, or there are no more allocation sets
+		if dayOfWeek == time.Saturday || i == len(asr.Allocations)-1 {
+			if length := len(toAccumulate.Allocations); length != 1 {
+				return nil, fmt.Errorf("failed accumulation, detected %d sets instead of 1", length)
+			}
+			result.Append(toAccumulate.Allocations[0])
+			toAccumulate = nil
+		}
+	}
+	return result, nil
 }
 
 // AggregateBy aggregates each AllocationSet in the range by the given
@@ -2434,4 +2707,17 @@ func (asr *AllocationSetRange) TotalCost() float64 {
 		tc += as.TotalCost()
 	}
 	return tc
+}
+
+// Clone returns a new AllocationSetRange cloned from the existing ASR
+func (asr *AllocationSetRange) Clone() *AllocationSetRange {
+	sasrClone := NewAllocationSetRange()
+	sasrClone.FromStore = asr.FromStore
+
+	for _, as := range asr.Allocations {
+		asClone := as.Clone()
+		sasrClone.Append(asClone)
+	}
+
+	return sasrClone
 }

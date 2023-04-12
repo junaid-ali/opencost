@@ -10,8 +10,6 @@ import (
 )
 
 const (
-	AppVersionEnvVar = "APP_VERSION"
-
 	AWSAccessKeyIDEnvVar     = "AWS_ACCESS_KEY_ID"
 	AWSAccessKeySecretEnvVar = "AWS_SECRET_ACCESS_KEY"
 	AWSClusterIDEnvVar       = "AWS_CLUSTER_ID"
@@ -97,7 +95,11 @@ const (
 	AllocationNodeLabelsIncludeList = "ALLOCATION_NODE_LABELS_INCLUDE_LIST"
 
 	regionOverrideList = "REGION_OVERRIDE_LIST"
+
+	ExportCSVFile = "EXPORT_CSV_FILE"
 )
+
+const DefaultConfigMountPath = "/var/configs"
 
 var offsetRegex = regexp.MustCompile(`^(\+|-)(\d\d):(\d\d)$`)
 
@@ -167,12 +169,6 @@ func GetPricingConfigmapName() string {
 
 func GetMetricsConfigmapName() string {
 	return Get(MetricsConfigmapName, "metrics-config")
-}
-
-// GetAWSAccessKeyID returns the environment variable value for AWSAccessKeyIDEnvVar which represents
-// the AWS access key for authentication
-func GetAppVersion() string {
-	return Get(AppVersionEnvVar, "1.91.0-rc.0")
 }
 
 // IsEmitNamespaceAnnotationsMetric returns true if cost-model is configured to emit the kube_namespace_annotations metric
@@ -314,10 +310,10 @@ func GetCSVPath() string {
 	return Get(CSVPathEnvVar, "")
 }
 
-// GetConfigPath returns the environment variable value for ConfigPathEnvVar which represents the cost
-// model configuration path
-func GetConfigPath() string {
-	return Get(ConfigPathEnvVar, "")
+// GetCostAnalyzerVolumeMountPath is an alias of GetConfigPath, which returns the mount path for the
+// Cost Analyzer volume, which stores configs, persistent data, etc.
+func GetCostAnalyzerVolumeMountPath() string {
+	return GetConfigPathWithDefault(DefaultConfigMountPath)
 }
 
 // GetConfigPath returns the environment variable value for ConfigPathEnvVar which represents the cost

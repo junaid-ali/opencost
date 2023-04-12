@@ -2191,12 +2191,11 @@ func (a *Accesses) ComputeAllocationHandlerSummary(w http.ResponseWriter, r *htt
 
 	// Accumulate, if requested
 	if accumulate {
-		as, err := asr.Accumulate()
+		asr, err = asr.Accumulate(kubecost.AccumulateOptionAll)
 		if err != nil {
 			WriteError(w, InternalServerError(err.Error()))
 			return
 		}
-		asr = kubecost.NewAllocationSetRange(as)
 	}
 
 	sasl := []*kubecost.SummaryAllocationSet{}
@@ -2222,14 +2221,14 @@ func (a *Accesses) ComputeAllocationHandler(w http.ResponseWriter, r *http.Reque
 		http.Error(w, fmt.Sprintf("Invalid 'window' parameter: %s", err), http.StatusBadRequest)
 	}
 
+	// Resolution is an optional parameter, defaulting to the configured ETL
+	// resolution.
+	resolution := qp.GetDuration("resolution", env.GetETLResolution())
+
 	// Step is an optional parameter that defines the duration per-set, i.e.
 	// the window for an AllocationSet, of the AllocationSetRange to be
 	// computed. Defaults to the window size, making one set.
 	step := qp.GetDuration("step", window.Duration())
-
-	// Resolution is an optional parameter, defaulting to the configured ETL
-	// resolution.
-	resolution := qp.GetDuration("resolution", env.GetETLResolution())
 
 	// Aggregation is an optional comma-separated list of fields by which to
 	// aggregate results. Some fields allow a sub-field, which is distinguished
@@ -2240,56 +2239,29 @@ func (a *Accesses) ComputeAllocationHandler(w http.ResponseWriter, r *http.Reque
 		http.Error(w, fmt.Sprintf("Invalid 'aggregate' parameter: %s", err), http.StatusBadRequest)
 	}
 
-	// Accumulate is an optional parameter, defaulting to false, which if true
-	// sums each Set in the Range, producing one Set.
-	accumulate := qp.GetBool("accumulate", false)
+	// IncludeIdle, if true, uses Asset data to incorporate Idle Allocation
+	includeIdle := qp.GetBool("includeIdle", false)
 
-	// AccumulateBy is an optional parameter that accumulates an AllocationSetRange
-	// by the resolution of the given time duration.
-	// Defaults to 0. If a value is not passed then the parameter is not used.
-	accumulateBy := qp.GetDuration("accumulateBy", 0)
+	// IdleByNode, if true, computes idle allocations at the node level.
+	// Otherwise it is computed at the cluster level. (Not relevant if idle
+	// is not included.)
+	idleByNode := qp.GetBool("idleByNode", false)
 
-	// Query for AllocationSets in increments of the given step duration,
-	// appending each to the AllocationSetRange.
-	asr := kubecost.NewAllocationSetRange()
-	stepStart := *window.Start()
-	for window.End().After(stepStart) {
-		stepEnd := stepStart.Add(step)
-		stepWindow := kubecost.NewWindow(&stepStart, &stepEnd)
+	// IncludeProportionalAssetResourceCosts, if true,
+	includeProportionalAssetResourceCosts := qp.GetBool("includeProportionalAssetResourceCosts", false)
 
-		as, err := a.Model.ComputeAllocation(*stepWindow.Start(), *stepWindow.End(), resolution)
-		if err != nil {
+	// include aggregated labels/annotations if true
+	includeAggregatedMetadata := qp.GetBool("includeAggregatedMetadata", true)
+
+	asr, err := a.Model.QueryAllocation(window, resolution, step, aggregateBy, includeIdle, idleByNode, includeProportionalAssetResourceCosts, includeAggregatedMetadata)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "bad request") {
+			WriteError(w, BadRequest(err.Error()))
+		} else {
 			WriteError(w, InternalServerError(err.Error()))
-			return
 		}
-		asr.Append(as)
 
-		stepStart = stepEnd
-	}
-
-	// Aggregate, if requested
-	if len(aggregateBy) > 0 {
-		err = asr.AggregateBy(aggregateBy, nil)
-		if err != nil {
-			WriteError(w, InternalServerError(err.Error()))
-			return
-		}
-	}
-
-	// Accumulate, if requested
-	if accumulateBy != 0 {
-		asr, err = asr.AccumulateBy(accumulateBy)
-		if err != nil {
-			WriteError(w, InternalServerError(err.Error()))
-			return
-		}
-	} else if accumulate {
-		as, err := asr.Accumulate()
-		if err != nil {
-			WriteError(w, InternalServerError(err.Error()))
-			return
-		}
-		asr = kubecost.NewAllocationSetRange(as)
+		return
 	}
 
 	w.Write(WrapData(asr, nil))

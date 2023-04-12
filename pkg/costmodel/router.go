@@ -1363,7 +1363,7 @@ func (a *Accesses) AddServiceKey(w http.ResponseWriter, r *http.Request, ps http
 
 	key := r.PostForm.Get("key")
 	k := []byte(key)
-	err := os.WriteFile(path.Join(env.GetConfigPathWithDefault("/var/configs/"), "key.json"), k, 0644)
+	err := os.WriteFile(path.Join(env.GetConfigPathWithDefault(env.DefaultConfigMountPath), "key.json"), k, 0644)
 	if err != nil {
 		fmt.Fprintf(w, "Error writing service key: "+err.Error())
 	}
@@ -1482,7 +1482,7 @@ func Initialize(additionalConfigWatchers ...*watcher.ConfigMapWatcher) *Accesses
 
 	var err error
 	if errorReportingEnabled {
-		err = sentry.Init(sentry.ClientOptions{Release: env.GetAppVersion()})
+		err = sentry.Init(sentry.ClientOptions{Release: version.FriendlyVersion()})
 		if err != nil {
 			log.Infof("Failed to initialize sentry for error reporting")
 		} else {
